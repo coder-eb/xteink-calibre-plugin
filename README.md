@@ -1,5 +1,7 @@
 # Calibre Plugins
 
+Fork of [crosspoint-reader/calibre-plugins](https://github.com/crosspoint-reader/calibre-plugins) with a stronger EPUB optimizer for the Xteink X3/X4: contrast boost, optional 4-level grey snapping, unused-CSS pruning, a colour-cover option and selectable chapter size. See [Image, CSS and chapter-size options](crosspoint_reader/README.md#image-css-and-chapter-size-options-030). Installing it replaces the stock plugin (same name).
+
 Calibre plugins for [CrossPoint Reader](https://github.com/crosspoint-reader).
 
 ## Plugins

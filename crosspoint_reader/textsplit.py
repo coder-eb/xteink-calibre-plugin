@@ -177,8 +177,9 @@ def split_big_paragraphs(html):
     return ''.join(out), changed
 
 
-def chunk_nodes(nodes, target):
+def chunk_nodes(nodes, target, limit=None):
     """Greedy-pack nodes into chunks <= ~target, recursing into big containers."""
+    limit = SPLIT_LIMIT if limit is None else limit
     chunks, cur, cur_len = [], [], 0
 
     def flush():
@@ -193,13 +194,13 @@ def chunk_nodes(nodes, target):
         cur, cur_len = [], 0
 
     for node in nodes:
-        if len(node) > SPLIT_LIMIT:
+        if len(node) > limit:
             flush()
             if node.startswith('<'):
                 m = re.match(r'<(\w+)[^>]*>', node)
                 open_tag, close_tag = m.group(0), '</%s>' % m.group(1)
                 inner = node[len(open_tag):-len(close_tag)]
-                pieces = [open_tag + sub + close_tag for sub in chunk_nodes(parse_nodes(inner), target)]
+                pieces = [open_tag + sub + close_tag for sub in chunk_nodes(parse_nodes(inner), target, limit)]
             else:
                 pieces = split_text_sentences(node, target)
             if pieces and cur:
@@ -217,17 +218,33 @@ def chunk_nodes(nodes, target):
     return chunks
 
 
-def split_xhtml_doc(doc, basename):
+def section_limits(opts):
+    """(split limit, chunk target) in bytes for the chosen section size.
+
+    ``opts.section_kb`` of 0 keeps the stock CrossPoint values. A larger value
+    means fewer, bigger spine files: less per-file overhead on the device, at
+    the cost of more RAM while one is laid out.
+    """
+    kb = int(getattr(opts, 'section_kb', 0) or 0)
+    if kb <= 0:
+        return SPLIT_LIMIT, CHUNK_TARGET
+    limit = max(SPLIT_LIMIT, kb * 1024)
+    return limit, int(limit * CHUNK_TARGET / float(SPLIT_LIMIT))
+
+
+def split_xhtml_doc(doc, basename, limit=None, target=None):
     """Return list of (relname, content); [] if no split needed/possible."""
+    limit = SPLIT_LIMIT if limit is None else limit
+    target = CHUNK_TARGET if target is None else target
     m = re.search(r'(<body[^>]*>)(.*)(</body>)', doc, re.S)
     if not m:
         return []
     body = m.group(2)
-    if len(body) <= SPLIT_LIMIT:
+    if len(body) <= limit:
         return []
     head = doc[:m.start(2)]
     tail = doc[m.end(2):]
-    chunks = chunk_nodes(parse_nodes(body), CHUNK_TARGET)
+    chunks = chunk_nodes(parse_nodes(body), target, limit)
     if len(chunks) < 2:
         return []
     base, dot, ext = basename.rpartition('.')
@@ -397,7 +414,7 @@ def _split_epub_text(path, log, result, profile, opts, source):
 
         # Pass 2: file splitting.
         try:
-            pieces = split_xhtml_doc(doc, posixpath.basename(zname))
+            pieces = split_xhtml_doc(doc, posixpath.basename(zname), *section_limits(opts))
         except Exception as exc:
             log('SPLIT-ERR', '%s: file split skipped (%s)' % (posixpath.basename(zname), exc))
             reverted.add(zname)

@@ -21,7 +21,7 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
     description = 'CrossPoint Reader wireless device'
     supported_platforms = ['windows', 'osx', 'linux']
     author = 'CrossPoint Reader'
-    version = (0, 2, 8)
+    version = (0, 3, 0)
 
     # Invalid USB vendor info to avoid USB scans matching.
     VENDOR_ID = [0xFFFF]
@@ -605,13 +605,18 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
         is never blocked by optimization.
         """
         from calibre.ptempfile import PersistentTemporaryFile
-        from .optimizer import optimize_epub, Options
+        from .optimizer import optimize_epub, Options, DEFAULT_CONTRAST
 
         opts = Options(
             quality=PREFS['optimize_quality'],
             grayscale=PREFS['optimize_grayscale'],
             auto_crop=PREFS['optimize_auto_crop'],
             split_text=PREFS['optimize_split'],
+            contrast=DEFAULT_CONTRAST if PREFS['optimize_contrast'] else 1.0,
+            quantize=PREFS['optimize_quantize'],
+            cover_color=PREFS['optimize_cover_color'],
+            prune_css=PREFS['optimize_css'],
+            section_kb=PREFS['optimize_section_kb'],
         )
 
         def _step(tag, message):

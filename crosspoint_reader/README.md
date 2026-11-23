@@ -60,6 +60,45 @@ processed in turn in the same dialog, which ends with combined totals. If
 optimization fails for a book, the original is sent unchanged so a transfer is
 never blocked.
 
+### Image, CSS and chapter-size options (0.3.0)
+
+Added after comparing against the Inky browser optimizer. Each is a setting
+under **Optimizer**; they only apply when **Optimize EPUBs before transfer** is on.
+
+| Option | Default | Effect |
+|---|---|---|
+| JPEG quality | **70** (was 85) | The largest single saving. 70 is visually fine on e-ink. |
+| Boost image contrast (x1.2) | on | Stretches tones around mid-grey; e-ink panels look flat without it. |
+| Snap images to the 4 grey levels | **off** | Hard-quantizes to 0/85/170/255. See the note below before turning it on. |
+| Keep the cover in colour | off | Cover is not greyed or contrast-adjusted and is scaled to fit 600x800 instead of the screen; the device greys it itself. |
+| Remove unused CSS | on | Drops stylesheets nothing links and rules whose class, id or element never occurs in the book. At-rules, `*`/`html`/`body` rules and any pseudo-class or attribute selector are always kept. |
+| Chapter size | Stock (about 9 KB) | **Larger (about 32 KB)** splits chapters far less often, so the book has about as many files as the original instead of roughly twice as many. Paragraph splitting (the out-of-memory guard) is unchanged. |
+
+**On 4-level snapping.** Measured on 12 large images per book (X3 profile, quality 70, contrast on):
+photos grew from 569 KB to 728 KB and comic pages from 1.55 MB to 1.71 MB when snapped, and
+light-grey text inside images (for example the credits on a promo page) washed out. The firmware
+already dithers to four levels itself, so it is left off by default. It is worth trying on
+pure line art.
+
+**Measured results** (X3 profile, real books, same machine; sizes in MB):
+
+| Book | Original | Previous optimizer | New defaults | New defaults + 32 KB chapters |
+|---|---|---|---|---|
+| The Seven Crystal Balls (comic) | 25.6 | 9.55 | 7.45 | 7.45 |
+| MacArthur Study Bible | 28.7 | 27.3 | 25.8 | 19.5 |
+| Gone Girl | 0.64 | 0.63 | 0.62 | 0.53 |
+| Steve Jobs | 2.47 | 2.98 | 2.59 | 2.38 |
+
+For Gone Girl the previous optimizer turned 89 archive files into 189; 32 KB chapters give 88.
+CSS pruning saved little on these four books (their stylesheets are small and almost fully used);
+it matters for books converted with very large stylesheets. These are file sizes, not on-device
+speed: that depends on the firmware, so try 32 KB chapters on your device.
+
+**Not carried over from Inky:** its text cleanup strips U+200C and U+200D (zero-width non-joiner
+and joiner). Those characters control conjunct formation in Tamil, Malayalam, Devanagari and other
+Indic scripts, so removing them corrupts the text; this plugin leaves them alone. It also changes
+character counts, which would invalidate the reading-position map.
+
 ### Using the optimizer
 
 1. Open **Preferences → Plugins**, expand **Device Interface plugins**, select

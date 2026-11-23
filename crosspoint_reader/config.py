@@ -37,7 +37,12 @@ PREFS.defaults['socket_timeout'] = 30
 PREFS.defaults['optimize'] = False
 PREFS.defaults['optimize_grayscale'] = True
 PREFS.defaults['optimize_auto_crop'] = False
-PREFS.defaults['optimize_quality'] = 85
+PREFS.defaults['optimize_quality'] = 70
+PREFS.defaults['optimize_contrast'] = True    # x1.2 around mid-grey
+PREFS.defaults['optimize_quantize'] = False   # snap to the panel's 4 grey levels (bigger files on photos)
+PREFS.defaults['optimize_cover_color'] = False
+PREFS.defaults['optimize_css'] = True         # drop unused CSS rules/stylesheets
+PREFS.defaults['optimize_section_kb'] = 0     # 0 = stock CrossPoint; 32 = larger sections
 PREFS.defaults['optimize_split'] = True
 PREFS.defaults['device_target'] = 'auto'  # 'auto' | 'X4' | 'X3'
 
@@ -76,6 +81,15 @@ class CrossPointConfigWidget(QWidget):
         self.optimize_auto_crop = QCheckBox('Auto-crop uniform margins', self)
         self.optimize_split = QCheckBox(
             'Split large chapters/paragraphs, remove fonts (prevents out-of-memory)', self)
+        self.optimize_contrast = QCheckBox('Boost image contrast (x1.2)', self)
+        self.optimize_quantize = QCheckBox(
+            'Snap images to the screen\'s 4 grey levels (smaller files; needs grayscale)', self)
+        self.optimize_cover_color = QCheckBox(
+            'Keep the cover in colour (the device greys it itself)', self)
+        self.optimize_css = QCheckBox('Remove unused CSS (faster chapter loading)', self)
+        self.optimize_section_kb = QComboBox(self)
+        self.optimize_section_kb.addItem('Stock CrossPoint (about 9 KB, safest)', 0)
+        self.optimize_section_kb.addItem('Larger (about 32 KB, fewer files, faster)', 32)
         self.optimize_quality = QSpinBox(self)
         self.optimize_quality.setRange(1, 100)
         self.optimize_quality.setSuffix('%')
@@ -103,6 +117,12 @@ class CrossPointConfigWidget(QWidget):
         self.optimize_auto_crop.setChecked(PREFS['optimize_auto_crop'])
         self.optimize_split.setChecked(PREFS['optimize_split'])
         self.optimize_quality.setValue(PREFS['optimize_quality'])
+        self.optimize_contrast.setChecked(PREFS['optimize_contrast'])
+        self.optimize_quantize.setChecked(PREFS['optimize_quantize'])
+        self.optimize_cover_color.setChecked(PREFS['optimize_cover_color'])
+        self.optimize_css.setChecked(PREFS['optimize_css'])
+        sidx = self.optimize_section_kb.findData(PREFS['optimize_section_kb'])
+        self.optimize_section_kb.setCurrentIndex(sidx if sidx >= 0 else 0)
         idx = self.device_target.findData(PREFS['device_target'])
         self.device_target.setCurrentIndex(idx if idx >= 0 else 0)
 
@@ -141,9 +161,10 @@ class CrossPointConfigWidget(QWidget):
 
         opt_heading = QLabel('<b>Optimizer</b>')
         layout.addRow(opt_heading)
-        opt_notice = QLabel('Mirrors the CrossPoint web optimizer: resizes images to the '
-                            'screen, converts to grayscale and re-encodes as JPEG, then '
-                            'rewrites the EPUB. A summary is shown after each transfer.')
+        opt_notice = QLabel('Resizes images to the screen, converts them to the panel\'s four grey '
+                            'levels and re-encodes as JPEG, removes unused CSS, splits chapters '
+                            'for the firmware\'s memory limits, then rewrites the EPUB. '
+                            'A summary is shown after each transfer.')
         opt_notice.setWordWrap(True)
         opt_notice.setStyleSheet('color: gray; font-style: italic;')
         layout.addRow('', opt_notice)
@@ -151,10 +172,16 @@ class CrossPointConfigWidget(QWidget):
         layout.addRow('Device target', self.device_target)
         layout.addRow('JPEG quality', self.optimize_quality)
         layout.addRow('', self.optimize_grayscale)
+        layout.addRow('', self.optimize_contrast)
+        layout.addRow('', self.optimize_quantize)
+        layout.addRow('', self.optimize_cover_color)
         layout.addRow('', self.optimize_auto_crop)
+        layout.addRow('', self.optimize_css)
         layout.addRow('', self.optimize_split)
+        layout.addRow('Chapter size', self.optimize_section_kb)
 
         self.optimize.toggled.connect(self._sync_optimizer_enabled)
+        self.optimize_grayscale.toggled.connect(lambda _c: self._sync_quantize_enabled())
         self._sync_optimizer_enabled(self.optimize.isChecked())
 
         self.log_view = QPlainTextEdit(self)
@@ -189,12 +216,26 @@ class CrossPointConfigWidget(QWidget):
         PREFS['optimize_auto_crop'] = bool(self.optimize_auto_crop.isChecked())
         PREFS['optimize_split'] = bool(self.optimize_split.isChecked())
         PREFS['optimize_quality'] = int(self.optimize_quality.value())
+        PREFS['optimize_contrast'] = bool(self.optimize_contrast.isChecked())
+        PREFS['optimize_quantize'] = bool(self.optimize_quantize.isChecked())
+        PREFS['optimize_cover_color'] = bool(self.optimize_cover_color.isChecked())
+        PREFS['optimize_css'] = bool(self.optimize_css.isChecked())
+        PREFS['optimize_section_kb'] = int(self.optimize_section_kb.currentData() or 0)
         PREFS['device_target'] = self.device_target.currentData()
 
     def _sync_optimizer_enabled(self, enabled):
         for w in (self.optimize_grayscale, self.optimize_auto_crop,
-                  self.optimize_split, self.optimize_quality, self.device_target):
+                  self.optimize_split, self.optimize_quality, self.device_target,
+                  self.optimize_contrast, self.optimize_quantize,
+                  self.optimize_cover_color, self.optimize_css,
+                  self.optimize_section_kb):
             w.setEnabled(enabled)
+        self._sync_quantize_enabled()
+
+    def _sync_quantize_enabled(self):
+        # 4-level snapping is a grayscale operation.
+        if self.optimize.isChecked():
+            self.optimize_quantize.setEnabled(self.optimize_grayscale.isChecked())
 
     def _refresh_logs(self):
         self.log_view.setPlainText(get_log_text())

@@ -42,6 +42,16 @@ DEFAULT_DEVICE = 'X4'
 
 DEFAULT_JPEG_QUALITY = 85
 
+# The X3/X4 panels show four grey levels. Snapping image tones to exactly
+# those levels (and giving them a little extra contrast first) shrinks the
+# JPEGs and stops the firmware from having to dither smooth gradients itself.
+# Levels and thresholds match the Inky browser optimizer.
+GRAY_LEVELS = (0, 85, 170, 255)
+DEFAULT_CONTRAST = 1.2
+# A colour cover is scaled to fit this box instead of the screen (it is shown
+# full-size on the sleep screen and in the library).
+COVER_MAX = (600, 800)
+
 # Auto-crop tuning (mirrors the web optimizer constants).
 CROP_WHITE_THRESHOLD = 245
 CROP_BACKGROUND_TOLERANCE = 28
@@ -82,13 +92,26 @@ def resolve_profile(device_target, detected_device):
 
 class Options(object):
     def __init__(self, quality=DEFAULT_JPEG_QUALITY, grayscale=True, auto_crop=False,
-                 split_text=True):
+                 split_text=True, contrast=1.0, quantize=False, cover_color=False,
+                 prune_css=False, section_kb=0):
         self.quality = int(quality)
         self.grayscale = bool(grayscale)
         self.auto_crop = bool(auto_crop)
         # Split oversized paragraphs/chapters and strip fonts for the
         # low-RAM firmware layout engine (see textsplit.py).
         self.split_text = bool(split_text)
+        # Contrast multiplier applied around mid-grey (1.0 = unchanged).
+        self.contrast = float(contrast or 1.0)
+        # Snap grayscale tones to the panel's four levels (needs grayscale).
+        self.quantize = bool(quantize)
+        # Keep the cover in colour (the device greys it itself); everything
+        # else still follows the grayscale/contrast/quantize options.
+        self.cover_color = bool(cover_color)
+        # Drop CSS rules and stylesheets that match nothing in the book.
+        self.prune_css = bool(prune_css)
+        # Split chapters bigger than this many KB of markup; 0 = the stock
+        # CrossPoint limit (see textsplit.py).
+        self.section_kb = int(section_kb or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +213,23 @@ def _should_skip_auto_crop(image_path, w, h):
     return bool(_COVER_NAME_RE.search(image_path or ''))
 
 
-def process_image(data, profile, opts, image_path=''):
+def _tone_lut(contrast, quantize):
+    """256-entry lookup table for contrast and/or 4-level snapping, or None."""
+    if (not contrast or abs(contrast - 1.0) < 1e-6) and not quantize:
+        return None
+    lut = []
+    for v in range(256):
+        d = float(v)
+        if contrast and abs(contrast - 1.0) >= 1e-6:
+            d = max(0.0, min(255.0, (d - 128.0) * contrast + 128.0))
+        if quantize:
+            d = GRAY_LEVELS[0] if d < 64 else GRAY_LEVELS[1] if d < 128 \
+                else GRAY_LEVELS[2] if d < 192 else GRAY_LEVELS[3]
+        lut.append(int(round(d)))
+    return lut
+
+
+def process_image(data, profile, opts, image_path='', is_cover=False):
     """Run the core optimization on a single image.
 
     Returns (jpeg_bytes, meta) where meta has orig/final dims + sizes + flags.
@@ -202,7 +241,11 @@ def process_image(data, profile, opts, image_path=''):
     im.load()
     orig_w, orig_h = im.size
     orig_size = len(data)
-    max_w, max_h = profile['width'], profile['height']
+    keep_color = bool(is_cover and opts.cover_color)
+    if keep_color:
+        max_w, max_h = COVER_MAX
+    else:
+        max_w, max_h = profile['width'], profile['height']
 
     src = im
     src_w, src_h = orig_w, orig_h
@@ -232,7 +275,13 @@ def process_image(data, profile, opts, image_path=''):
 
     # --- flatten onto white, grayscale, JPEG --------------------------------
     rgb = _flatten_white_rgb(scaled)
-    out = rgb.convert('L') if opts.grayscale else rgb
+    if keep_color or not opts.grayscale:
+        out = rgb
+    else:
+        out = rgb.convert('L')
+        lut = _tone_lut(opts.contrast, opts.quantize)
+        if lut is not None:
+            out = out.point(lut)
     buf = io.BytesIO()
     out.save(buf, 'JPEG', quality=int(opts.quality), optimize=True)
     jpeg = buf.getvalue()
@@ -553,6 +602,35 @@ def _extract_identifier(opf_text):
 # Public entry point
 # ---------------------------------------------------------------------------
 
+_ITEM_RE = re.compile(r'<(?:\w+:)?item\b[^>]*>', re.IGNORECASE)
+_META_COVER_RE = re.compile(
+    r"""<(?:\w+:)?meta\b[^>]*\bname\s*=\s*["']cover["'][^>]*>""", re.IGNORECASE)
+
+
+def _tag_attr(tag, name):
+    m = re.search(r"""\b%s\s*=\s*(?:"([^"]*)"|'([^']*)')""" % name, tag, re.IGNORECASE)
+    if not m:
+        return ''
+    return m.group(1) if m.group(1) is not None else (m.group(2) or '')
+
+
+def _find_cover_path(opf_name, opf_text):
+    """Archive path of the OPF-declared cover image, or None."""
+    if not opf_text:
+        return None
+    from .cssprune import resolve
+    items = _ITEM_RE.findall(opf_text)
+    cover_id = None
+    m = _META_COVER_RE.search(opf_text)
+    if m:
+        cover_id = _tag_attr(m.group(0), 'content')
+    for tag in items:
+        props = _tag_attr(tag, 'properties').split()
+        if 'cover-image' in props or (cover_id and _tag_attr(tag, 'id') == cover_id):
+            return resolve(opf_name, _tag_attr(tag, 'href'))
+    return None
+
+
 def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
     """Optimize an EPUB at ``in_path``, writing the result to ``out_path``.
 
@@ -586,10 +664,15 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
         'elapsed': 0.0,
     }
 
-    log('INFO', '%s (%s) — target %s %dx%d, quality %d%%, grayscale %s, auto-crop %s' % (
+    log('INFO', '%s (%s) — target %s %dx%d, quality %d%%, grayscale %s, auto-crop %s, '
+        'contrast x%.1f, 4-level %s, colour cover %s, prune CSS %s' % (
         summary['name'], _human(orig_size), profile['label'],
         profile['width'], profile['height'], opts.quality,
-        'ON' if opts.grayscale else 'OFF', 'ON' if opts.auto_crop else 'OFF'))
+        'ON' if opts.grayscale else 'OFF', 'ON' if opts.auto_crop else 'OFF',
+        getattr(opts, 'contrast', 1.0),
+        'ON' if (opts.grayscale and getattr(opts, 'quantize', False)) else 'OFF',
+        'ON' if getattr(opts, 'cover_color', False) else 'OFF',
+        'ON' if getattr(opts, 'prune_css', False) else 'OFF'))
 
     zin = zipfile.ZipFile(in_path, 'r')
     try:
@@ -599,11 +682,33 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
         identifier = None
 
         # First locate the OPF (for NCX identifier sync).
+        opf_name = None
         for n in names:
             if n.lower().endswith('.opf'):
+                opf_name = n
                 opf_text = _decode_text(zin.read(n))
                 identifier = _extract_identifier(opf_text)
                 break
+
+        cover_path = None
+        if getattr(opts, 'cover_color', False):
+            cover_path = _find_cover_path(opf_name, opf_text)
+
+        css_plan = None
+        if getattr(opts, 'prune_css', False):
+            try:
+                from .cssprune import plan_css
+                css_plan = plan_css(names, lambda name: _decode_text(zin.read(name)))
+                if css_plan.active:
+                    summary['css_removed'] = css_plan.rules_removed
+                    summary['css_files_removed'] = len(css_plan.drop)
+                    log('CSS', '%d unused rule(s) and %d stylesheet(s) removed' % (
+                        css_plan.rules_removed, len(css_plan.drop)))
+                else:
+                    css_plan = None
+            except Exception as exc:
+                css_plan = None
+                log('CSS-ERR', 'CSS pruning skipped: %s' % exc)
 
         with zipfile.ZipFile(out_path, 'w') as zout:
             # mimetype FIRST, stored uncompressed, per the OCF spec.
@@ -622,7 +727,7 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
 
                 if RASTER_RE.search(low):
                     try:
-                        jpeg, meta = process_image(data, profile, opts, n)
+                        jpeg, meta = process_image(data, profile, opts, n, is_cover=(n == cover_path))
                         summary['images'] += 1
                         if meta['cropped']:
                             summary['cropped'] += 1
@@ -641,6 +746,9 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
                 elif XHTML_RE.search(low):
                     text = _decode_text(data)
                     text, fixes = _fix_xhtml(text, log)
+                    if css_plan is not None:
+                        from .cssprune import strip_links
+                        text = strip_links(text, n, css_plan.drop)
                     summary['fixes'] += fixes
                     zout.writestr(n, text.encode('utf-8'),
                                   compress_type=zipfile.ZIP_DEFLATED)
@@ -649,6 +757,9 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
                     text = _decode_text(data)
                     text = _rename_basename_refs(text)
                     text = _fix_opf(text, log)
+                    if css_plan is not None:
+                        from .cssprune import strip_manifest
+                        text = strip_manifest(text, n, css_plan.drop)
                     zout.writestr(n, text.encode('utf-8'),
                                   compress_type=zipfile.ZIP_DEFLATED)
                     summary['fixes'] = max(summary['fixes'], before)
@@ -662,7 +773,11 @@ def optimize_epub(in_path, out_path, profile, opts, log_fn=None):
                     zout.writestr(n, new_text.encode('utf-8'),
                                   compress_type=zipfile.ZIP_DEFLATED)
                 elif low.endswith('.css'):
-                    text = _decode_text(data)
+                    if css_plan is not None:
+                        if n in css_plan.drop:
+                            continue
+                        data = css_plan.text.get(n, None) or data
+                    text = _decode_text(data) if isinstance(data, bytes) else data
                     zout.writestr(n, _rename_basename_refs(text).encode('utf-8'),
                                   compress_type=zipfile.ZIP_DEFLATED)
                 else:

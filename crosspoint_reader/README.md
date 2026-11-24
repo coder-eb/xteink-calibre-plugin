@@ -128,6 +128,40 @@ character counts, which would invalidate the reading-position map.
 To turn the feature off, uncheck **Optimize EPUBs before transfer** — books are
 then sent exactly as Calibre exports them.
 
+### Why books were missing or unmarked (fixed in 0.3.1)
+
+Four separate problems made Calibre's device view disagree with the device:
+
+1. **The cache was keyed by IP address.** When the router gave the device a new
+   address, everything the plugin remembered about it was discarded. The cache is
+   now keyed by the device's hardware serial (from `/api/status`); falls back to the
+   IP if the serial is unavailable. Identities saved under old IP-based keys are
+   adopted automatically on the next connect (same path *and* size = same file).
+2. **A failed listing hid books and wiped the cache.** The device is a single-threaded
+   ESP32 on Wi-Fi, so a request can time out. A folder that failed was silently
+   skipped and its books' cached identities were pruned. Listing now retries each
+   folder, and a folder that still fails keeps showing its cached books and cache.
+   The Calibre log notes `listing incomplete`.
+3. **Title matching was too literal.** Names built from Calibre's sort forms
+   (`Kite Runner, The - Hosseini, Khaled.epub`) or with `_` substituted for punctuation
+   (`... Howard, Jonathan L_.epub`) never matched. Matching now ignores case, accents
+   and punctuation, restores `Title, The`, tries `Title - Author` and `Author - Title`,
+   and uses the author (in either `First Last` or `Last, First` form) and the folder
+   name to tell same-titled books apart. Two library entries that are identical are
+   still left unmatched rather than guessed.
+4. **Books not in the library showed the raw file name.** They now show a clean
+   title and author parsed from the name.
+
+Name-based matches are no longer cached, so they always follow your current library.
+Only identities known for certain (a book you sent, or one read with *Fetch metadata*)
+are cached. With debug logging on, the log lists every device file that was not
+matched to the library.
+
+Measured on one real library of 664 books, using the 48 distinct device files whose library
+identity was known: the previous matcher got 29 right and missed 19; this one gets 47 right,
+0 wrong, and misses 1 (three identical "Anna Karenina" library entries, left ambiguous on
+purpose; its identity comes from the cache instead).
+
 ## On-device status
 
 When the device connects, Calibre marks the library books that are already on it

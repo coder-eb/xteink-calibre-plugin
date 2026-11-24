@@ -30,6 +30,25 @@ def get_entry(device_id, lpath):
     return _books().get(device_id, {}).get(lpath)
 
 
+def get_all(device_id):
+    """Return a copy of every cached ``{lpath: entry}`` for ``device_id``."""
+    return dict(_books().get(device_id, {}))
+
+
+def adopt_legacy(device_id, files):
+    """Carry identities over from old IP-keyed caches; returns how many.
+
+    See :func:`devicelogic.adopt_legacy`.
+    """
+    from .devicelogic import adopt_legacy as _adopt
+    books = _books()
+    before = set(books)
+    adopted = _adopt(books, device_id, files)
+    if adopted or set(books) != before:
+        _CACHE['books'] = books
+    return adopted
+
+
 def put_many(device_id, entries):
     """Store/overwrite many ``(lpath, entry_dict)`` pairs for one device."""
     if not entries:

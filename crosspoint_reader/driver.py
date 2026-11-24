@@ -10,7 +10,7 @@ from calibre.devices.usbms.deviceconfig import DeviceConfig
 from calibre.devices.usbms.books import Book, BookList
 from calibre.ebooks.metadata.book.base import Metadata
 
-from . import ws_client
+from . import devicelogic, matching, ws_client
 from .config import CrossPointConfigWidget, PREFS
 from .log import add_log
 
@@ -21,7 +21,7 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
     description = 'CrossPoint Reader wireless device'
     supported_platforms = ['windows', 'osx', 'linux']
     author = 'CrossPoint Reader'
-    version = (0, 3, 0)
+    version = (0, 3, 1)
 
     # Invalid USB vendor info to avoid USB scans matching.
     VENDOR_ID = [0xFFFF]
@@ -45,6 +45,7 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
         self.device_host = None
         self.device_port = None
         self.device_model = None  # 'X3' | 'X4' from /api/status
+        self.device_serial = None  # hardware serial from /api/status (stable across IPs)
         self.last_discovery = 0.0
         self.report_progress = lambda x, y: x
         self._debug_enabled = False
@@ -118,6 +119,9 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
         try:
             status = self._http_get_json('/api/status', timeout=4)
             model = (status or {}).get('device')
+            self.device_serial = ((status or {}).get('serial') or '').strip() or None
+            if self.device_serial:
+                self._log(f'[CrossPoint] device serial: {self.device_serial}')
             if model in ('X3', 'X4'):
                 self.device_model = model
                 self._log(f'[CrossPoint] detected device model: {model}')
@@ -135,7 +139,7 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
     def get_device_information(self, end_session=True):
         host = self.device_host or PREFS['host']
         device_info = {
-            'device_store_uuid': 'crosspoint-' + host.replace('.', '-'),
+            'device_store_uuid': self._device_id(),
             'device_name': 'CrossPoint Reader',
             'device_version': '1',
         }
@@ -155,9 +159,13 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
         return f'http://{host}'
 
     def _device_id(self):
-        """Stable id for the connected device, used to key the metadata cache."""
+        """Stable id for the connected device, used to key the metadata cache.
+
+        Based on the device's hardware serial, so a new DHCP address does not
+        make it look like a different device (and discard what we know).
+        """
         host = self.device_host or PREFS['host']
-        return 'crosspoint-' + host.replace('.', '-')
+        return devicelogic.stable_device_id(self.device_serial, host)
 
     def _http_get_json(self, path, params=None, timeout=5):
         url = self._http_base() + path
@@ -197,38 +205,36 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
     def save_settings(self, config_widget):
         config_widget.save()
 
-    def _list_files_recursive(self, path='/'):
-        """Return a flat list of (lpath, size) for all EPUB files on device."""
-        results = []
-        try:
-            entries = self._http_get_json('/api/files', params={'path': path})
-        except Exception as exc:
-            self._log(f'[CrossPoint] listing {path} failed: {exc}')
-            return results
-        for entry in entries:
-            name = entry.get('name', '')
-            if not name:
-                continue
-            if path == '/':
-                entry_path = '/' + name
-            else:
-                entry_path = path + '/' + name
-            if entry.get('isDirectory'):
-                results.extend(self._list_files_recursive(entry_path))
-            elif entry.get('isEpub'):
-                results.append((entry_path, entry.get('size', 0)))
-        return results
-
     def books(self, oncard=None, end_session=True):
         if oncard is not None:
             return BookList(None, None, None)
         from . import metadata_cache as mc
-        file_list = self._list_files_recursive('/')
+        device_id = self._device_id()
+
+        # List the device, retrying transient Wi-Fi failures. A folder that
+        # still cannot be listed is reported, never silently dropped.
+        scan = devicelogic.scan_device(
+            lambda p: self._http_get_json('/api/files', params={'path': p}, timeout=10),
+            log=self._log)
+        file_list = list(scan.files)
+        if scan.failed_dirs:
+            self._log('[CrossPoint] WARNING: could not list %s - showing cached '
+                      'entries for them and keeping their cache' % ', '.join(scan.failed_dirs))
+            file_list.extend(devicelogic.stale_cached_files(
+                mc.get_all(device_id), {p for p, _s in file_list}, scan.failed_dirs))
+
+        # Carry over what an older IP-keyed cache knew about these files.
+        adopted = mc.adopt_legacy(
+            device_id, [(self._normalize_device_path(p), s) for p, s in file_list])
+        if adopted:
+            self._log(f'[CrossPoint] recovered {adopted} book identities from earlier connections')
+
         bl = BookList(None, None, None)
         fetch_metadata = PREFS['fetch_metadata']
-        device_id = self._device_id()
         library = self._build_library_index()
         seen = set()
+        counts = {'cache': 0, 'library': 0, 'download': 0, 'filename': 0}
+        unmatched = []
         total = len(file_list)
         for i, (lpath, size) in enumerate(file_list):
             key = self._normalize_device_path(lpath)
@@ -236,43 +242,54 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
             if total:
                 self.report_progress(i / float(total), 'Reading books on device...')
             meta = None
-            # Prefer the cache: a book sent from this machine is recognized
-            # instantly (with its library uuid) so Calibre marks it on-device
-            # without re-downloading. Size guards against a changed file.
+            # 1. Identity remembered from when we sent the book (exact uuid).
             entry = mc.get_entry(device_id, key)
             if entry and entry.get('size') == size:
                 meta = Metadata(
-                    entry.get('title') or os.path.splitext(os.path.basename(lpath))[0],
+                    entry.get('title') or matching.parse_filename(
+                        os.path.splitext(os.path.basename(lpath))[0])[0],
                     list(entry.get('authors') or []))
                 if entry.get('uuid'):
                     meta.uuid = entry['uuid']
-            # Match the filename against the local library by title (no download).
-            # A book can only be "on device" if it is in the library, so this
-            # marks side-loaded books instantly when their name matches.
+                counts['cache'] += 1
+            # 2. Match the name/folder against the library (no download). Not
+            #    cached: it is cheap and always reflects the current library.
             if meta is None and library is not None:
                 m = self._match_from_library(library, lpath)
                 if m is not None:
                     meta = m
-                    mc.put_many(device_id,
-                                [(key, mc.entry_from_metadata(size, m))])
-            # Last resort, opt-in: download the EPUB to read its exact identity,
-            # for library books whose on-device filename doesn't match the title.
+                    counts['library'] += 1
+            # 3. Opt-in last resort: download the EPUB to read its exact identity.
             if meta is None and fetch_metadata:
                 m = self._fetch_epub_identity(lpath)
                 if m is not None:
                     meta = m
-                    mc.put_many(device_id,
-                                [(key, mc.entry_from_metadata(size, m))])
+                    mc.put_many(device_id, [(key, mc.entry_from_metadata(size, m))])
+                    counts['download'] += 1
+            # 4. Not in the library: still show a clean title/author parsed
+            #    from the name instead of the raw file name.
             if meta is None:
-                meta = Metadata(os.path.splitext(os.path.basename(lpath))[0], [])
+                title, authors = matching.parse_filename(
+                    os.path.splitext(os.path.basename(lpath))[0])
+                meta = Metadata(title, authors)
+                counts['filename'] += 1
+                unmatched.append(key)
             book = Book('', lpath, size=size, other=meta)
             if getattr(meta, 'uuid', None):
                 book.uuid = meta.uuid
             bl.add_book(book, replace_metadata=True)
         if total:
             self.report_progress(1.0, 'Reading books on device...')
-        # Forget files that are no longer on the device.
+        # Forget files that are really gone. `seen` includes cached entries for
+        # folders we failed to list, so a timeout can never wipe their cache.
         mc.prune(device_id, seen)
+        self._log('[CrossPoint] %d books on device: %d from cache, %d matched to '
+                  'library, %d downloaded, %d not in library%s' % (
+                      total, counts['cache'], counts['library'], counts['download'],
+                      counts['filename'],
+                      '' if scan.complete else ' (listing incomplete)'))
+        for key in unmatched[:50]:
+            self._log(f'[CrossPoint] not matched to the library: {key}')
         return bl
 
     def sync_booklists(self, booklists, end_session=True):
@@ -780,17 +797,11 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
         tf.seek(0)
         return tf
 
-    @staticmethod
-    def _norm_title(text):
-        from calibre.utils.filenames import ascii_filename
-        return ascii_filename(text or '').strip().lower()
-
     def _build_library_index(self):
-        """Index the current library as normalized-title -> [book_id].
+        """Index the current library for matching device files to books.
 
-        Lets ``books()`` match a device file to a library book by name without
-        downloading anything. Returns ``(api, index)`` or None if the library
-        isn't available (e.g. no GUI).
+        Returns ``(api, LibraryIndex)`` or None if the library isn't available
+        (e.g. no GUI).
         """
         try:
             from calibre.gui2.ui import get_gui
@@ -798,55 +809,43 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
             if gui is None:
                 return None
             api = gui.current_db.new_api
-            book_ids = api.all_book_ids()
-            titles = api.all_field_for('title', book_ids)
-            index = {}
-            for bid, title in titles.items():
-                key = self._norm_title(title)
-                if key:
-                    index.setdefault(key, []).append(bid)
-            return (api, index)
+            ids = list(api.all_book_ids())
+            titles = api.all_field_for('title', ids)
+            sorts = api.all_field_for('sort', ids)
+            authors = api.all_field_for('authors', ids)
+            author_sorts = api.all_field_for('author_sort', ids)
+            rows = [{
+                'id': bid,
+                'title': titles.get(bid) or '',
+                'title_sort': sorts.get(bid) or '',
+                'authors': list(authors.get(bid) or ()),
+                'author_sort': author_sorts.get(bid) or '',
+            } for bid in ids]
+            return (api, matching.LibraryIndex(rows))
         except Exception as exc:
             self._log(f'[CrossPoint] library index unavailable: {exc}')
             return None
 
     def _match_from_library(self, library, lpath):
-        """Find the library book matching a device file name. Returns Metadata|None.
+        """Find the library book matching a device file. Returns Metadata|None.
 
-        Matches the filename stem (and, for ``Title - Author`` style names, the
-        part before the last `` - ``) against library titles. When several books
-        share a title, an author appearing in the device path disambiguates;
-        if still ambiguous, returns None rather than risk a wrong mark.
+        See :mod:`matching` for the rules; an ambiguous name is left unmatched
+        rather than risk marking the wrong book as on-device.
         """
         api, index = library
-        stem = os.path.splitext(os.path.basename(lpath))[0]
-        candidates = list(index.get(self._norm_title(stem), ()))
-        if not candidates and ' - ' in stem:
-            candidates = list(index.get(self._norm_title(stem.rsplit(' - ', 1)[0]), ()))
-        if not candidates:
+        m = index.match(lpath)
+        if m is None:
             return None
-        if len(candidates) > 1:
-            path_norm = self._norm_title(lpath)
-
-            def author_in_path(bid):
-                for a in (api.field_for('authors', bid) or ()):
-                    # Match every word of the author name, order-independent, so
-                    # "Emily Dickinson" matches an author-sort path "Dickinson, Emily".
-                    tokens = self._norm_title(a).split()
-                    if tokens and all(t in path_norm for t in tokens):
-                        return True
-                return False
-
-            narrowed = [bid for bid in candidates if author_in_path(bid)]
-            if len(narrowed) != 1:
-                return None  # ambiguous — don't guess
-            candidates = narrowed
-        bid = candidates[0]
-        mi = Metadata(api.field_for('title', bid) or stem,
+        bid = m.book_id
+        mi = Metadata(api.field_for('title', bid) or '',
                       list(api.field_for('authors', bid) or []))
         uuid = api.field_for('uuid', bid)
         if uuid:
             mi.uuid = uuid
+        for attr, field in (('title_sort', 'sort'), ('author_sort', 'author_sort')):
+            val = api.field_for(field, bid)
+            if val:
+                setattr(mi, attr, val)
         return mi
 
     def _fetch_epub_identity(self, lpath):
